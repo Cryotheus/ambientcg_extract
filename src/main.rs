@@ -11,7 +11,7 @@ use image::ImageFormat::Png;
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
-use smallvec::SmallVec;
+use smallvec::{SmallVec};
 use std::env::current_dir;
 use std::fs::{self, File};
 use std::io::{stdin, stdout, BufRead, BufReader, Write};
@@ -300,10 +300,8 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 			[bytes @ .., b'K'] => std::str::from_utf8(bytes).ok().and_then(|str| str.parse::<u8>().ok()).is_some(),
 			_ => false,
 		} {
-			//
+			finished_folder = finished_folder.split_at(underscore_index).0;
 		}
-
-		finished_folder = finished_folder.split_at(underscore_index).0;
 	}
 
 	finished_folder = finished_folder.trim_end_matches(['-', '_']);
