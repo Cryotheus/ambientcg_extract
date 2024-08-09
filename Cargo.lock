@@ -867,6 +867,7 @@ name = "q_ambientcg_extract"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cfg-if",
  "image",
  "indicatif",
  "rayon",

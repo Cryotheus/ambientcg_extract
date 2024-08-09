@@ -1,5 +1,3 @@
-extern crate core;
-
 mod utils;
 
 use std::collections::HashMap;
@@ -8,12 +6,12 @@ use utils::*;
 use crate::utils::AcgeError::InvalidImageFileExtension;
 use anyhow::bail;
 use image::ImageFormat::Png;
-use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+use image::{ColorType, DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
-use smallvec::{SmallVec};
+use smallvec::SmallVec;
 use std::env::current_dir;
-use std::fs::{self, File};
+use std::fs::{self, File, read_dir};
 use std::io::{stdin, stdout, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -26,6 +24,7 @@ enum ProcessingMethod {
 struct ImageBake {
 	rename: &'static str,
 	config_lines: Option<SmallVec<[&'static str; 4]>>,
+	color: Option<ColorType>,
 	edited_image: Option<DynamicImage>,
 }
 
@@ -34,6 +33,7 @@ impl ImageBake {
 		Self {
 			rename,
 			config_lines: Some(config_multiline.lines().collect()),
+			color: None,
 			edited_image: None,
 		}
 	}
@@ -42,16 +42,24 @@ impl ImageBake {
 		Self {
 			rename,
 			config_lines: None,
+			color: None,
 			edited_image: None,
 		}
 	}
 
-	pub fn from_postfix_path(postfix: &str, path: impl AsRef<Path>) -> anyhow::Result<Option<ProcessingMethod>> {
+	pub fn from_postfix_path(postfix: &str) -> anyhow::Result<Option<ProcessingMethod>> {
 		Ok(Some(match postfix {
 			"AmbientOcclusion" => ProcessingMethod::Single(ImageBake::config("ao", "ao = true")),
 			"Color" => ProcessingMethod::Single(ImageBake::new("color")),
-			"Displacement" => ProcessingMethod::Single(ImageBake::config("depth", "depth = 1.0")),
-			"NormalGL" => ProcessingMethod::Single(ImageBake::config("normal", "normal = \"OpenGL\"")),
+			"Displacement" => ProcessingMethod::Single(ImageBake::config("depth", "depth = 0.01\ndepth_method = 8")),
+
+			"NormalGL" => ProcessingMethod::Single(ImageBake {
+				rename: "normal",
+				config_lines: Some(SmallVec::from_vec(["normal = \"OpenGL\""].to_vec())),
+				color: Some(ColorType::Rgb16),
+				edited_image: None,
+			}),
+
 			"Metalness" => ProcessingMethod::Dependent,
 			"Roughness" => ProcessingMethod::Dependent,
 
@@ -176,11 +184,13 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 	let mut config_lines = SmallVec::<[&'static str; 8]>::new();
 	let mut multi_process = HashMap::<String, PathBuf>::new();
 
+	config_lines.push("tile = true");
+
 	//rename remaining files
 	for file_path in file_paths {
 		let postfix = file_path.file_stem().indoc_str()?.split_at(shortest_common_prefix.len()).1;
 
-		if let Some(processing_method) = ImageBake::from_postfix_path(postfix, &file_path)? {
+		if let Some(processing_method) = ImageBake::from_postfix_path(postfix)? {
 			match processing_method {
 				ProcessingMethod::Single(image_bake) => {
 					let new_path = file_path.with_file_name(format!("{}.png", image_bake.rename));
@@ -189,11 +199,62 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 						config_lines.append(&mut append_lines);
 					}
 
-					if let Some(edited_image) = image_bake.edited_image {
+					let fn_color_space_correction = |image: &DynamicImage| -> Option<DynamicImage> {
+						if let Some(enforced) = image_bake.color {
+							//change the color to whatever is enforced
+							if image.color() == enforced {
+								None
+							} else {
+								let image = image.clone();
+
+								Some(match enforced {
+									ColorType::L8 => image.into_luma8().into(),
+									ColorType::La8 => image.into_luma_alpha8().into(),
+									ColorType::Rgb8 => image.into_rgb8().into(),
+									ColorType::Rgba8 => image.into_rgba8().into(),
+									ColorType::L16 => image.into_luma16().into(),
+									ColorType::La16 => image.into_luma_alpha16().into(),
+									ColorType::Rgb16 => image.into_rgb16().into(),
+									ColorType::Rgba16 => image.into_rgba16().into(),
+									ColorType::Rgb32F => image.into_rgb32f().into(),
+									ColorType::Rgba32F => image.into_rgba32f().into(),
+									color_space => {
+										println!("unrecognized color space {color_space:?}");
+										return None;
+									}
+								})
+							}
+						} else {
+							//change the color to something more common
+							match image.color() {
+								//probably bevy compatible
+								ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8 | ColorType::Rgb32F | ColorType::Rgba32F => None,
+
+								//not bevy compatible
+								ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => Some(image.clone().into_rgba8().into()),
+
+								color_space => {
+									println!("unrecognized color space {color_space:?}");
+									None
+								}
+							}
+						}
+					};
+
+					if let Some(mut edited_image) = image_bake.edited_image {
+						if let Some(corrected_image) = fn_color_space_correction(&edited_image) {
+							edited_image = corrected_image;
+						}
+
 						edited_image.save(file_path.with_file_name(new_path))?;
 						to_delete.push(file_path);
 					} else {
-						fs::rename(file_path, new_path)?;
+						if let Some(corrected_image) = fn_color_space_correction(&image::load(BufReader::new(File::open(&file_path)?), Png)?) {
+							corrected_image.save(file_path.with_file_name(new_path))?;
+							to_delete.push(file_path);
+						} else {
+							fs::rename(file_path, new_path)?
+						}
 					}
 				}
 
@@ -268,19 +329,15 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 	}
 
 	//create the material config
-	if config_lines.is_empty() {
-		fs::write(extract_dir.join("material.toml"), "#intentionally empty\n")?;
-	} else {
-		config_lines.sort_unstable();
+	config_lines.sort_unstable();
 
-		let joined = config_lines.join("\n");
-		let mut file_handle = File::create(extract_dir.join("material.toml"))?;
+	let joined = config_lines.join("\n");
+	let mut file_handle = File::create(extract_dir.join("material.toml"))?;
 
-		file_handle.write_all(joined.as_bytes())?;
-		file_handle.write_all(b"\n")?;
-	}
+	file_handle.write_all(joined.as_bytes())?;
+	file_handle.write_all(b"\n")?;
 
-	//os should batch this...
+	//batch me glados
 	for file_path in to_delete {
 		fs::remove_file(file_path)?;
 	}
@@ -305,8 +362,45 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 	}
 
 	finished_folder = finished_folder.trim_end_matches(['-', '_']);
+	let finished_path = extract_dir.with_file_name(finished_folder.to_ascii_lowercase());
 
-	fs::rename(&extract_dir, extract_dir.with_file_name(finished_folder.to_ascii_lowercase()))?;
+	//rename the folder
+	//annoying impl for windows because... windows.
+	cfg_if::cfg_if! {
+		if #[cfg(windows)] {
+			fs::create_dir(&finished_path)?;
+
+			//move contents of folder to other folder
+			for entry in read_dir(&extract_dir)? {
+				let Ok(entry) = entry else {
+					continue;
+				};
+
+				let Ok(meta) = entry.metadata() else {
+					continue;
+				};
+
+				if meta.is_dir() {
+					continue;
+				}
+
+				let path = entry.path();
+
+				let Some(file_name) = path.file_name() else {
+					continue;
+				};
+
+				fs::rename(&path, finished_path.join(file_name))?;
+			}
+
+			//delete the old folder
+			fs::remove_dir_all(&extract_dir)?;
+		} else {
+			//linux works fine
+			//not sure about macos
+			fs::rename(&extract_dir, finished_path)?;
+		}
+	}
 
 	Ok(())
 }
