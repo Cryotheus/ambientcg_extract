@@ -17,3 +17,9 @@ above to every zip file in the current working directory.
 ## Building
 1. Install the latest stable build of [Rust](https://www.rust-lang.org/tools/install).  
 2. In the repository's working directory, run cargo build` or `cargo build --release`.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in `ambientcg_extract` by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
