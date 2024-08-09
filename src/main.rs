@@ -1,9 +1,7 @@
 mod utils;
 
-use std::collections::HashMap;
 use utils::*;
 
-use crate::utils::AcgeError::InvalidImageFileExtension;
 use anyhow::bail;
 use image::ImageFormat::Png;
 use image::{ColorType, DynamicImage, ImageBuffer, ImageFormat, Rgb};
@@ -11,10 +9,13 @@ use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::env::current_dir;
-use std::fs::{self, File, read_dir};
+use std::collections::HashMap;
+use std::fs::{self, read_dir, File};
 use std::io::{stdin, stdout, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+/// Single lets the image process alone.
+/// Dependent means the image requires access to a sibling image.
 enum ProcessingMethod {
 	Single(ImageBake),
 	Dependent,
@@ -68,20 +69,97 @@ impl ImageBake {
 	}
 }
 
-/// `Err(_)` = incorrect
-/// `Ok(())` = correct
-/// Because the try operator doesn't like bools?
+/// Returns `Ok(())` if correct.
 fn correct_extension(path: impl AsRef<Path>) -> Result<(), AcgeError> {
 	match path.as_ref().extension().indoc_str()? {
 		//TODO: more exts
 		//e.g.  | "tga" | "exr"
 		//we will need to carry extension data around though...
 		"png" => Ok(()),
-		extension => Err(InvalidImageFileExtension(extension.into())),
+		extension => Err(AcgeError::InvalidImageFileExtension(extension.into())),
 	}
 }
 
-fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+	let cwd = current_dir()?;
+	let mut zip_paths: Vec<PathBuf> = Vec::new();
+
+	for entry in cwd.read_dir()? {
+		let Ok(entry) = entry else {
+			continue;
+		};
+
+		let Ok(metadata) = entry.metadata() else {
+			continue;
+		};
+
+		if metadata.is_dir() {
+			continue;
+		}
+
+		let path = entry.path();
+
+		//check if the extension is zip
+		match path.extension() {
+			None => continue,
+			Some(os_str) => match os_str.to_str() {
+				None => continue,
+				Some("zip") => {}
+				Some(_) => continue,
+			},
+		}
+
+		zip_paths.push(path);
+	}
+
+	zip_paths.sort_unstable();
+
+	//let the user know what's about to get affected
+	{
+		let mut stdout_lock = stdout().lock();
+		stdout_lock.write_all(b"The following zip archives will extracted:\n")?;
+
+		for (index, zip_path) in zip_paths.iter().enumerate() {
+			writeln!(
+				stdout_lock,
+				"{index} \t- {}",
+				zip_path.file_name().and_then(|os_str| os_str.to_str()).unwrap_or("<unknown>")
+			)?;
+		}
+
+		stdout_lock.write_all(b"Continue? (Y/N):\n")?;
+	}
+
+	//get confirmation from stdin
+	let mut buffer = String::new();
+
+	stdin().lock().read_line(&mut buffer).unwrap();
+
+	if buffer.chars().next().unwrap().to_lowercase().next().unwrap() != 'y' {
+		return Ok(());
+	}
+
+	//extract and collect the extraction results into a vec
+	let results = zip_paths.into_par_iter().progress().map(process_zip).collect::<Vec<_>>();
+
+	//spit out the results
+	{
+		let mut stdout_lock = stdout().lock();
+
+		for (index, result) in results.iter().enumerate() {
+			write!(stdout_lock, "{index}\t")?;
+
+			match result {
+				Ok(()) => stdout_lock.write_all(b"[  OK  ]\n")?,
+				Err(error) => writeln!(stdout_lock, "[FAILED]\n\t Error: {error:#?}")?,
+			}
+		}
+	}
+
+	Ok(())
+}
+
+fn process_zip(zip_path: PathBuf) -> anyhow::Result<()> {
 	let extract_dir = zip_path.with_extension("");
 	let mut zip_reader = zip::read::ZipArchive::new(BufReader::new(File::open(&zip_path)?))?;
 
@@ -201,13 +279,14 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 
 					let fn_color_space_correction = |image: &DynamicImage| -> Option<DynamicImage> {
 						if let Some(enforced) = image_bake.color {
-							//change the color to whatever is enforced
+							//change the color to whatever is enforced by the ImageBake
 							if image.color() == enforced {
 								None
 							} else {
 								let image = image.clone();
 
 								Some(match enforced {
+									//isn't there a function for this or something?
 									ColorType::L8 => image.into_luma8().into(),
 									ColorType::La8 => image.into_luma_alpha8().into(),
 									ColorType::Rgb8 => image.into_rgb8().into(),
@@ -218,8 +297,9 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 									ColorType::Rgba16 => image.into_rgba16().into(),
 									ColorType::Rgb32F => image.into_rgb32f().into(),
 									ColorType::Rgba32F => image.into_rgba32f().into(),
-									color_space => {
-										println!("unrecognized color space {color_space:?}");
+									color_format => {
+										println!("unrecognized color format {color_format:?}");
+
 										return None;
 									}
 								})
@@ -230,11 +310,12 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 								//probably bevy compatible
 								ColorType::L8 | ColorType::La8 | ColorType::Rgb8 | ColorType::Rgba8 | ColorType::Rgb32F | ColorType::Rgba32F => None,
 
-								//not bevy compatible
+								//not bevy compatible (at least not globally, fine for normal maps)
 								ColorType::L16 | ColorType::La16 | ColorType::Rgb16 | ColorType::Rgba16 => Some(image.clone().into_rgba8().into()),
 
-								color_space => {
-									println!("unrecognized color space {color_space:?}");
+								color_format => {
+									println!("unrecognized color format {color_format:?}");
+
 									None
 								}
 							}
@@ -399,85 +480,6 @@ fn extract_n_stuff(zip_path: PathBuf) -> anyhow::Result<()> {
 			//linux works fine
 			//not sure about macos
 			fs::rename(&extract_dir, finished_path)?;
-		}
-	}
-
-	Ok(())
-}
-
-fn main() -> anyhow::Result<()> {
-	let cwd = current_dir()?;
-	let mut zip_paths: Vec<PathBuf> = Vec::new();
-
-	for entry in cwd.read_dir()? {
-		let Ok(entry) = entry else {
-			continue;
-		};
-
-		let Ok(metadata) = entry.metadata() else {
-			continue;
-		};
-
-		if metadata.is_dir() {
-			continue;
-		}
-
-		let path = entry.path();
-
-		//check if the extension is zip
-		match path.extension() {
-			None => continue,
-			Some(os_str) => match os_str.to_str() {
-				None => continue,
-				Some("zip") => {}
-				Some(_) => continue,
-			},
-		}
-
-		zip_paths.push(path);
-	}
-
-	zip_paths.sort_unstable();
-
-	//let the user know what's about to get affected
-	{
-		let mut stdout_lock = stdout().lock();
-		stdout_lock.write_all(b"The following zip archives will extracted:\n")?;
-
-		for (index, zip_path) in zip_paths.iter().enumerate() {
-			writeln!(
-				stdout_lock,
-				"{index} \t- {}",
-				zip_path.file_name().and_then(|os_str| os_str.to_str()).unwrap_or("<unknown>")
-			)?;
-		}
-
-		stdout_lock.write_all(b"Continue? (Y/N):\n")?;
-	}
-
-	//get confirmation from stdin
-	let mut buffer = String::new();
-
-	stdin().lock().read_line(&mut buffer).unwrap();
-
-	if buffer.chars().next().unwrap().to_lowercase().next().unwrap() != 'y' {
-		return Ok(());
-	}
-
-	//extract and collect the extraction results into a vec
-	let results = zip_paths.into_par_iter().progress().map(extract_n_stuff).collect::<Vec<_>>();
-
-	//spit out the results
-	{
-		let mut stdout_lock = stdout().lock();
-
-		for (index, result) in results.iter().enumerate() {
-			write!(stdout_lock, "{index}\t")?;
-
-			match result {
-				Ok(()) => stdout_lock.write_all(b"[  OK  ]\n")?,
-				Err(error) => writeln!(stdout_lock, "[FAILED]\n\t Error: {error:#?}")?,
-			}
 		}
 	}
 
