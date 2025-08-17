@@ -16,7 +16,7 @@ above to every zip file in the current working directory.
 
 ## Building
 1. Install the latest stable build of [Rust](https://www.rust-lang.org/tools/install).  
-2. In the repository's working directory, run cargo build` or `cargo build --release`.
+2. In the repository's working directory, run `cargo build` or `cargo build --release`.
 
 ### Contribution
 
